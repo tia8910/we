@@ -774,30 +774,46 @@ async function doChangePw(){
   var spreadsheetId=m[1];
   var btn=document.getElementById('cp-save-btn');btn.disabled=true;btn.innerHTML='⏳ Saving...';
   try{
-    // Step 1: get actual sheet name from metadata (avoids hardcoding "Sheet1")
-    var metaRes=await fetch('https://sheets.googleapis.com/v4/spreadsheets/'+spreadsheetId+'?fields=sheets.properties.title',{headers:{Authorization:'Bearer '+googleToken}});
-    if(!metaRes.ok)throw new Error('Could not access spreadsheet ('+metaRes.status+'). Make sure the Sheet is shared with your Google account.');
-    var meta=await metaRes.json();
-    var sheetName=meta.sheets&&meta.sheets[0]&&meta.sheets[0].properties.title;
-    if(!sheetName)throw new Error('Could not detect sheet tab name.');
+    // Step 1: Read sheet via public CSV URL (same as login — no auth needed)
+    var csvRes=await fetch(SHEET_CSV_URL);
+    if(!csvRes.ok)throw new Error('Could not load user list from Sheet ('+csvRes.status+').');
+    var rows=parseCSV(await csvRes.text());
+    if(rows.length<1)throw new Error('Sheet appears empty.');
 
-    // Step 2: read all values
-    var readRes=await fetch('https://sheets.googleapis.com/v4/spreadsheets/'+spreadsheetId+'/values/'+encodeURIComponent(sheetName),{headers:{Authorization:'Bearer '+googleToken}});
-    if(!readRes.ok)throw new Error('Could not read sheet data ('+readRes.status+').');
-    var data=await readRes.json();
-    var rows=data.values||[];
-    if(rows.length<2)throw new Error('Sheet appears empty.');
-    var headers=rows[0].map(function(h){return(h||'').trim().toLowerCase();});
-    var pwCol=headers.indexOf('password'),userCol=headers.indexOf('username');
-    if(pwCol===-1)throw new Error('No "password" column found in your Sheet header row.');
-    if(userCol===-1)throw new Error('No "username" column found in your Sheet header row.');
-    var rowIdx=rows.findIndex(function(r,i){return i>0&&(r[userCol]||'').trim().toLowerCase()===currentUser.username.toLowerCase();});
+    // Find column positions from header
+    var headerRow=Object.keys(rows[0]);  // parseCSV already normalised headers
+    var rowIdx=-1;
+    var pwColLetter='';
+    // We need raw row index — re-parse manually to get column positions
+    var rawCsv=await (await fetch(SHEET_CSV_URL)).text();
+    var rawLines=rawCsv.trim().split('\n').filter(function(l){return l.trim();});
+    var rawHeaders=rawLines[0].split(',').map(function(h){return h.trim().toLowerCase().replace(/[^a-z0-9_]/g,'');});
+    var pwCol=rawHeaders.indexOf('password');
+    var userCol=rawHeaders.indexOf('username');
+    if(pwCol===-1)throw new Error('No "password" column found in Sheet.');
+    if(userCol===-1)throw new Error('No "username" column found in Sheet.');
+    for(var i=1;i<rawLines.length;i++){
+      var cols=rawLines[i].split(',');
+      if((cols[userCol]||'').trim().toLowerCase()===currentUser.username.toLowerCase()){
+        rowIdx=i+1; // +1 because Sheets rows are 1-indexed and row 1 is header
+        break;
+      }
+    }
     if(rowIdx===-1)throw new Error('Your username was not found in the Sheet.');
 
-    // Step 3: write new password
-    var cellRef=encodeURIComponent(sheetName+'!'+colToLetter(pwCol)+(rowIdx+1));
-    var writeRes=await fetch('https://sheets.googleapis.com/v4/spreadsheets/'+spreadsheetId+'/values/'+cellRef+'?valueInputOption=RAW',{method:'PUT',headers:{Authorization:'Bearer '+googleToken,'Content-Type':'application/json'},body:JSON.stringify({values:[[newPw]]})});
-    if(!writeRes.ok)throw new Error('Failed to write to Sheet ('+writeRes.status+'). Make sure you have edit access to the Sheet.');
+    // Step 2: Write new password via Sheets API
+    // Use column letter + row number without sheet name (defaults to first sheet)
+    var colLetter=colToLetter(pwCol);
+    var range=encodeURIComponent(colLetter+rowIdx);
+    var writeRes=await fetch(
+      'https://sheets.googleapis.com/v4/spreadsheets/'+spreadsheetId+'/values/'+range+'?valueInputOption=RAW',
+      {method:'PUT',headers:{Authorization:'Bearer '+googleToken,'Content-Type':'application/json'},
+       body:JSON.stringify({values:[[newPw]]})}
+    );
+    if(!writeRes.ok){
+      var errBody=await writeRes.json().catch(function(){return{};});
+      throw new Error('Could not write to Sheet ('+(errBody.error&&errBody.error.message||writeRes.status)+'). Make sure the Google account you signed in with has Editor access to the Sheet.');
+    }
     currentUser.password=newPw;
     btn.disabled=false;btn.innerHTML='💾 Save Password';
     showCpOk('Password updated! Active immediately.');
